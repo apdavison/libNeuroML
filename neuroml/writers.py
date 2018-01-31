@@ -1,3 +1,8 @@
+# encoding: utf-8
+from __future__ import division
+import os
+import io
+from math import sqrt, pi
 import neuroml
 
 
@@ -176,6 +181,7 @@ class JSONWriter(object):
         encoded_dict = json.loads(encoded)
         collection.insert(encoded_dict)
 
+
 class ArrayMorphWriter(object):
     """
     For now just testing a simple method which can write a morphology, not a NeuroMLDocument.
@@ -249,3 +255,160 @@ class ArrayMorphWriter(object):
             
         # Finally, close the file (this also will flush all the remaining buffers!)
         fileh.close()
+
+
+
+def morphology_to_swc(morphology, filename=None):
+    """
+    Export a NeuroML morphology as a standardized SWC file
+    """
+
+    # ---- Try to find segment groups corresponding to the SWC "types"
+    #      ("soma", "axon", "basal dendrite", "apical dendrite")
+    SOMA = 1
+    AXON = 2
+    BASAL_DENDRITE = 3
+    APICAL_DENDRITE = 4
+    DENDRITE = 33
+
+    neurolex_ids = {
+        "GO:0043025": SOMA,
+        "GO:0030424": AXON,
+        "GO:0030425": DENDRITE,
+        "GO:0097441": BASAL_DENDRITE,
+        "GO:0097440": APICAL_DENDRITE
+    }
+    segment_group_index = {}
+    for segment_group in morphology.segment_groups:
+        segment_group_index[segment_group.id] = segment_group
+
+    region_index = {}
+    for segment_group in morphology.segment_groups:
+        if segment_group.neuro_lex_id in neurolex_ids:
+            region = neurolex_ids[segment_group.neuro_lex_id]
+            region_index[region] = []
+            for member in segment_group.members:
+                region_index[region].append(member.segment)
+            for include in segment_group.includes:
+                included_group = segment_group_index[include.segment_groups]  # note plural attibute name but singular value
+                for member in included_group.members:
+                    region_index[region].append(member.segments)             # note plural attibute name but singular value
+                assert len(included_group.includes) == 0  # todo: recursively resolve includes
+    
+    if SOMA not in region_index:
+        raise Exception("Cannot convert to SWC, no soma indicated")
+    if AXON not in region_index:
+        raise Exception("Cannot convert to SWC, no axon indicated")
+    if BASAL_DENDRITE not in region_index:
+        if DENDRITE not in region_index:
+            raise Exception("Cannot convert to SWC, no dendrites indicated")
+        # to be improved. Could also use segment group names to infer regions
+        region_index[BASAL_DENDRITE] = region_index.pop(DENDRITE)
+        print("Warning: assigning all dendrites as basal dendrites")
+
+    reverse_region_index = {}
+    for region, seg_ids in region_index.items():
+        for seg_id in seg_ids:
+            assert seg_id not in reverse_region_index
+            reverse_region_index[seg_id] = region
+    # check that all segments have a region
+    assert len(reverse_region_index) == len(morphology.segments)
+
+    # ---- Transform non-spherical soma (e.g. cylindrical) to a spherical equivalent
+    soma_segments = [seg for seg in morphology.segments if seg.id in region_index[SOMA]]
+    if len(soma_segments) == 1:
+        seg = soma_segments[0]
+        x = (seg.proximal.x + seg.distal.x)/2
+        y = (seg.proximal.y + seg.distal.y)/2
+        z = (seg.proximal.z + seg.distal.z)/2
+        area = frustum_surface(seg.proximal, seg.distal, sides="lateral")
+    elif len(soma_segments) == 2:
+        seg0, seg1 = soma_segments
+        assert seg1.parent.segments == seg0.id
+        x = (seg0.proximal.x + seg1.distal.x)/2
+        y = (seg0.proximal.y + seg1.distal.y)/2
+        z = (seg0.proximal.z + seg1.distal.z)/2
+        area = frustum_surface(seg0.proximal, seg0.distal, sides="lateral")
+        area += frustum_surface(seg0.distal, seg1.distal, sides="lateral")
+    else:
+        raise NotImplementedError("todo")
+    
+    NO_PARENT = -1  # or zero? Seems not to be defined in the spec
+    soma_point = {
+        "id": 0,
+        "type": SOMA,
+        "x": x,
+        "y": y,
+        "z": z,
+        "radius": sqrt(area / (4 * pi)),
+        "parent": NO_PARENT 
+    }
+
+    # ---- Extract points from all segments
+    points = [soma_point]
+    for segment in morphology.segments:
+        if segment.id not in region_index[SOMA]:
+            assert segment.parent is not None
+            if segment.parent.segments in region_index[SOMA]:  # note plural attribute name but singular value
+                parent = soma_point["id"]
+            else:
+                parent = segment.parent.segments
+            # todo: check that segment.proximal (if not None) matches parent.distal
+            point = {
+                "id": segment.id,
+                "type": reverse_region_index[segment.id],
+                "x": segment.distal.x,
+                "y": segment.distal.y,
+                "z": segment.distal.z,
+                "radius": segment.distal.diameter / 2,
+                "parent": parent
+            }
+            points.append(point)
+    
+    # sort the points by NeuroML ID. This is not essential, but is likely to make it easier to check the SWC
+    points.sort(key=lambda point: point["id"])
+
+    # construct a map from NeuroML segment id to point index
+    id_map = {}
+    for i, point in enumerate(points, start=1):
+        id_map[point["id"]] = i
+
+    # remap id and parent
+    for point in points:
+        point["id"] = id_map[point["id"]]
+        if point["parent"] != NO_PARENT:
+            point["parent"] = id_map[point["parent"]]
+
+    # ---- Now export to swc
+    if filename is None:
+        filename = morphology.id + ".swc"
+    assert filename.endswith(".swc")
+    with io.open(filename, "w", encoding="ascii") as fp:
+        fp.write(u"# Generated from NeuroML morphology {} by libNeuroML\n".format(morphology.id))
+        for point in points:
+            fp.write(u"{id} {type} {x} {y} {z} {radius} {parent}\n".format(**point))
+
+
+def frustum_surface(base, top, sides="all"):
+    """
+    Returns the surface area of the right conical frustum
+    represented by two circles, "base" and "top".
+
+    You can choose to return the partial surface area
+    of only the top, the base or the lateral sides.
+    """
+    possible_sides = ("lateral", "base", "top", "all")
+    if sides not in possible_sides:
+        raise ValueError("sides must be one of {}".format(possible_sides))
+    R = base.diameter / 2
+    r = top.diameter / 2
+    h = sqrt((top.x - base.x)**2 + (top.y - base.y)**2 + (top.z - base.z)**2)
+    A = 0
+    if sides in ("lateral", "all"):
+        A += pi * (R + r) * sqrt(h**2 + (R - r)**2)
+    if sides in ("base", "all"):
+        A += pi * R * R
+    if sides in  ("top", "all"):
+        A += pi * r * r
+    return A
+
