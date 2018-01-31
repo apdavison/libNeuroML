@@ -257,6 +257,142 @@ class ArrayMorphWriter(object):
         fileh.close()
 
 
+class ABCWriter(object):
+    """
+    docstring needed
+    """
+
+    @classmethod
+    def write(cls, neuroml_document, output_path):
+        """docstring needed"""
+
+        from string import Template
+        import numpy as np
+        import h5py
+
+        if len(neuroml_document.networks) > 1:
+            raise Exception("This format cannot handle multiple Networks in a single document")
+        if len(neuroml_document.networks) == 0:
+            raise Exception("The document must contain at least one Network")
+
+        if neuroml_document.includes:
+            raise NotImplementedError("Unresolved includes."
+                                      "Please load the document using `read_neuroml2_file(filename, include_includes=True)`")
+
+        # --- define directory layout ---
+        config = {
+            "target_simulator": "NEURON",
+            "manifest": {
+                "$BASE_DIR": "${configdir}",
+                "$NETWORK_DIR": "$BASE_DIR/networks",
+                "$COMPONENT_DIR": "$BASE_DIR/components"
+            },
+            "components": {
+                "morphologies": "$COMPONENT_DIR/morphologies",
+                "synaptic_models": "$COMPONENT_DIR/synapse_dynamics",
+                "point_neuron_models": "$COMPONENT_DIR/point_neuron_dynamics",
+                "mechanisms":"$COMPONENT_DIR/mechanisms",
+                "biophysical_neuron_models": "$COMPONENT_DIR/biophysical_neuron_dynamics",
+                "templates": "$COMPONENT_DIR/hoc_templates",
+            },
+            "networks": {
+                "node_files": [
+                    {
+                        "nodes": "$NETWORK_DIR/nodes.h5",
+                        "node_types": "$NETWORK_DIR/node_types.csv"
+                    }
+                ],
+                "edge_files":[
+                    {
+                        "edges": "$NETWORK_DIR/edges.h5",
+                        "edge_types": "$NETWORK_DIR/edge_types.csv"
+                    },
+                ]
+            }
+        }
+
+        base_dir = Template(config["manifest"]["$BASE_DIR"]).substitute(configdir=output_path)
+        network_dir = Template(config["manifest"]["$NETWORK_DIR"]).substitute(BASE_DIR=base_dir)
+        component_dir = Template(config["manifest"]["$COMPONENT_DIR"]).substitute(BASE_DIR=base_dir)
+
+        for directory in (base_dir, network_dir, component_dir):
+            os.makedirs(directory)
+
+        # --- export morphologies ---
+        morph_path = Template(config["components"]["morphologies"]).substitute(COMPONENT_DIR=component_dir)
+        os.mkdir(morph_path)
+        for cell in neuroml_document.cells:
+            print cell.id
+            morphology_to_swc(cell.morphology, 
+                              filename=os.path.join(morph_path, cell.id + ".swc"))
+
+        # --- export mechanisms ---
+        mech_path = Template(config["components"]["mechanisms"]).substitute(COMPONENT_DIR=component_dir)
+        os.mkdir(mech_path)
+        
+
+        # --- export nodes ---
+        nodes_path = Template(config["networks"]["node_files"][0]["nodes"]).substitute(NETWORK_DIR=network_dir)
+        nodes_file = h5py.File(nodes_path, 'w-')  # fail if exists
+
+        #   add some annotations
+        nodes_file["id"] = neuroml_document.id
+        nodes_file["notes"] = neuroml_document.notes
+        if hasattr(neuroml_document, "temperature"):
+            nodes_file["temperature"] = neuroml_document.temperature  # I'm not sure this is the right place to put this
+
+        net = neuroml_document.networks[0]
+
+        n = sum(p.get_size() for p in net.populations)
+        root = nodes_file.create_group("nodes")  # todo: add attribute with network name
+        root.create_dataset("node_gid", shape=(n,), dtype='i4')
+        root.create_dataset("node_type_id", shape=(n,), dtype='i2')
+        root.create_dataset("node_group", shape=(n,), dtype='S32')  # todo: calculate the max label size
+        root.create_dataset("node_group_index", shape=(n,), dtype='i2')
+
+        offset = 0
+        for i, population in enumerate(net.populations):
+            if population.type != "populationList":
+                raise NotImplementedError
+            m = population.get_size()
+            index = slice(offset, offset + m)
+            root["node_gid"][index] = np.arange(offset, offset + m, dtype=int)
+            root["node_type_id"][index] = i * np.ones((m,))
+            root["node_group"][index] = np.array([population.id] * m)
+            root["node_group_index"][index] = np.arange(m, dtype=int)
+
+            node_group = root.create_group(population.id)
+
+            x, y, z = np.array([(i.location.x, i.location.y, i.location.z)
+                                for i in population.instances]).T
+            node_group.create_dataset('x', data=x)
+            node_group.create_dataset('y', data=y)
+            node_group.create_dataset('z', data=z)
+            #population.component
+
+            offset += m
+
+             
+        for syn_conn in net.synaptic_connections:
+            pass
+
+        for exp_inp in net.explicit_inputs:
+            pass
+
+        for proj in net.projections:
+            pass
+            
+        for eproj in net.electrical_projections:
+            pass
+            
+        for cproj in net.continuous_projections:
+            pass
+            
+        for il in net.input_lists:
+            pass
+
+        nodes_file.close()
+
 
 def morphology_to_swc(morphology, filename=None):
     """
